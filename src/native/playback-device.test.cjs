@@ -10,11 +10,13 @@ const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, 'playback-device.js'), 'utf8');
 const endpoint = 'https://log5-applog-lf.fqnovel.com/service/2/device_register/?tt_data=a&cronet_version=8d40f833_2026-03-03&ttnet_version=4.2.243.31-douyin&use_store_region_cookie=1';
-const failureMessage = '匿名播放设备注册失败，请检查网络，10 秒后重试';
-function load(clock = Date) {
+const alternateEndpoint = endpoint.replace('log5-applog-lf.fqnovel.com', 'is.snssdk.com');
+const failureMessage = '匿名播放设备注册失败，请检查网络后重试';
+function load({ now } = {}) {
     const module = { exports: {} };
     vm.runInNewContext(source, {
-        module, Buffer, AbortSignal, Date: clock,
+        module, Buffer, AbortSignal,
+        Date: now ? class extends Date { static now() { return now(); } } : Date,
         require(name) {
             assert.ok(['node:crypto', 'node:zlib'].includes(name), 'no transport or persistence dependencies');
             return require(name);
@@ -98,7 +100,7 @@ test('binary request decrypts to authenticated gzip JSON with the fixed anonymou
     assert.equal(url, endpoint);
     assert.equal(options.method, 'POST');
     assert.ok(Buffer.isBuffer(options.data), 'send raw binary, not base64 text');
-    assert.ok(deadline >= started + 8000 && deadline <= Date.now() + 8000);
+    assert.ok(deadline >= started + 4000 && deadline <= Date.now() + 4000);
     assert.ok(signal instanceof AbortSignal);
     assert.equal(signal.aborted, false);
     assert.equal(options.headers['Content-Type'], 'application/octet-stream;tt-data=a');
@@ -149,7 +151,7 @@ test('binary request decrypts to authenticated gzip JSON with the fixed anonymou
     assert.doesNotMatch(JSON.stringify(payload), /"(?:account|account_id|user_id|uid|sessionid|session_id|device_token|access_token|refresh_token|cookie|cookies|authorization|password|phone_number)"\s*:/i);
 });
 
-test('synchronous and asynchronous failures share a safe error during cooldown', async () => {
+test('synchronous and asynchronous failures share bounded fallback and expose only a safe registration error', async () => {
     for (const synchronous of [true, false]) {
         const get = load();
         let calls = 0;
@@ -160,12 +162,13 @@ test('synchronous and asynchronous failures share a safe error during cooldown',
             return Promise.reject(unsafe);
         });
         const results = await Promise.allSettled(Array.from({ length: 10 }, () => get(() => assert.fail('no retry'))));
-        assert.equal(calls, 1);
+        assert.equal(calls, 2, 'one primary and one fixed official fallback, shared by every caller');
         assert.ok(results.every(result => result.status === 'rejected' && result.reason === results[0].reason));
         const error = results[0].reason;
         assert.equal(error.code, 'DEVICE_REGISTRATION_FAILED');
         assert.equal(error.message, failureMessage);
-        assert.deepEqual(Object.keys(error), ['code', 'registrationFailure']);
+        assert.deepEqual(Object.keys(error), ['code', 'reason', 'registrationFailure']);
+        assert.equal(error.reason, 'timeout');
         assert.equal(error.registrationFailure, 'TIMEOUT');
         assert.equal(error.cause, undefined);
         assert.doesNotMatch(String(error.stack) + JSON.stringify(error), /PRIVATE_RESPONSE_SENTINEL/);
@@ -180,9 +183,9 @@ test('initial registration failure recovers after cooldown without a restart or 
     const fail = async () => { calls++; throw Object.assign(new Error('PRIVATE_RESPONSE_SENTINEL'), { code: 'ECONNRESET' }); };
     const first = get(fail);
     await assert.rejects(first, { code: 'DEVICE_REGISTRATION_FAILED' });
-    now += 9999;
+    now += 29999;
     assert.equal(get(() => assert.fail('cooldown must prevent retries')), first);
-    assert.equal(calls, 1);
+    assert.equal(calls, 2);
     now++;
     let finish;
     const recovered = get(() => { calls++; return new Promise(resolve => { finish = resolve; }); });
@@ -195,22 +198,22 @@ test('initial registration failure recovers after cooldown without a restart or 
     assert.ok((await Promise.all(concurrent)).every(value => value === identity));
     now += 60000;
     assert.equal(get(() => assert.fail('keep successful identity')), recovered);
-    assert.equal(calls, 2);
+    assert.equal(calls, 3);
 });
 
 test('a repeated registration failure starts a new cooldown instead of a retry storm', async () => {
     let now = Date.now(), calls = 0;
     const get = load({ now: () => now });
-    const fail = async () => { calls++; throw new Error('PRIVATE_RESPONSE_SENTINEL'); };
+    const fail = async () => { calls++; throw Object.assign(new Error('PRIVATE_RESPONSE_SENTINEL'), { code: 'ECONNRESET' }); };
     const first = get(fail);
     await assert.rejects(first);
-    now += 10000;
+    now += 30000;
     const second = get(fail);
     assert.notEqual(second, first);
     await assert.rejects(second);
-    now += 9999;
+    now += 29999;
     assert.equal(get(() => assert.fail('second cooldown')), second);
-    assert.equal(calls, 2);
+    assert.equal(calls, 4);
 });
 
 test('registration reports only whitelisted failure reasons without retaining response or credentials', async () => {
@@ -273,4 +276,109 @@ test('business rejection cannot be accepted even if IDs are present', async () =
             code: 'DEVICE_REGISTRATION_FAILED', message: failureMessage,
         });
     }
+});
+
+function registrationHeader(options) {
+    const data = options.data;
+    const salt = Buffer.from('4dd4c2e6b83162090e52b3c7a6733ba41cb2462b829ab58a196b39db57177524f49baf7f08e8d68d26a72e37c1a95a2f1f05a51892aef2949732b62a38aadd58', 'hex');
+    const derived = crypto.createHash('sha512').update(Buffer.concat([
+        crypto.createHash('sha512').update(data.subarray(6, 38)).digest(), salt,
+    ])).digest();
+    const decipher = crypto.createDecipheriv('aes-128-cbc', derived.subarray(0, 16), derived.subarray(16, 32));
+    const plaintext = Buffer.concat([decipher.update(data.subarray(38)), decipher.final()]);
+    return JSON.parse(gunzipSync(plaintext.subarray(64)).toString('utf8')).header;
+}
+
+test('DNS/reset/timeout/server failures fall back only to the equivalent official TLS origin', async () => {
+    for (const failure of [
+        ...['ENOENT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT'].map(code => ({ code })),
+        { status: 503 },
+    ]) {
+        const get = load();
+        const requests = [];
+        const identity = await get(async (url, options, deadline, signal) => {
+            requests.push({ url, options });
+            assert.ok(deadline > Date.now() && deadline <= Date.now() + 4000);
+            assert.equal(signal.aborted, false);
+            if (url === endpoint) throw Object.assign(new Error('PRIVATE_RESPONSE_SENTINEL'), failure);
+            assert.equal(url, alternateEndpoint);
+            return { device_id_str: '12345', install_id_str: '67890' };
+        });
+        assert.equal(requests.length, 2);
+        assert.equal(requests[0].options, requests[1].options, 'fallback resends the same binary body, headers and profile');
+        assert.equal(identity.device_id, '12345');
+        assert.equal((await get(() => assert.fail('success must remain cached'))), identity);
+    }
+});
+
+test('business, TLS, security and invalid-response errors never trigger another registration origin', async () => {
+    for (const failure of [
+        { status: 403 }, { status: 429 }, { code: 'SECURITY_BLOCKED' },
+        { code: 'ERR_TLS_CERT_ALTNAME_INVALID' }, { code: 'CERT_HAS_EXPIRED' }, { code: 'INVALID_RESPONSE' },
+    ]) {
+        let now = Date.now();
+        const get = load({ now: () => now });
+        let calls = 0;
+        const first = get(async () => { calls++; throw Object.assign(new Error('PRIVATE_RESPONSE_SENTINEL'), failure); });
+        await assert.rejects(first, { code: 'DEVICE_REGISTRATION_FAILED', reason: 'rejected' });
+        now += 60000;
+        assert.equal(get(() => assert.fail('no retry on permanent rejection')), first);
+        assert.equal(calls, 1);
+    }
+});
+
+test('transient failure retries after cooldown without changing anonymous device identity or multiplying requests', async () => {
+    let now = Date.now();
+    const get = load({ now: () => now });
+    const headers = [];
+    let calls = 0;
+    const failed = get(async (_url, options) => {
+        calls++;
+        headers.push(registrationHeader(options));
+        throw Object.assign(new Error('PRIVATE_RESPONSE_SENTINEL'), { code: 'ENOTFOUND' });
+    });
+    await assert.rejects(failed, { code: 'DEVICE_REGISTRATION_FAILED', reason: 'dns' });
+    now += 29999;
+    assert.equal(get(() => assert.fail('cooldown must suppress repeat registrations')), failed);
+    assert.equal(calls, 2);
+    now += 1;
+    const retry = get(async (url, options) => {
+        calls++;
+        assert.equal(url, endpoint);
+        headers.push(registrationHeader(options));
+        return { device_id: '123', install_id: '456' };
+    });
+    assert.notEqual(retry, failed);
+    const concurrent = Array.from({ length: 20 }, () => get(() => assert.fail('must share retry')));
+    assert.ok(concurrent.every(promise => promise === retry));
+    const identity = await retry;
+    assert.equal(calls, 3);
+    for (const header of headers) {
+        for (const key of ['cdid', 'openudid', 'clientudid', 'apk_first_install_time']) {
+            assert.equal(header[key], headers[0][key], key + ' must survive transient retries');
+        }
+        assert.equal(header.cdid, identity.cdid);
+    }
+    assert.ok((await Promise.all(concurrent)).every(value => value === identity));
+    now += 60000;
+    assert.equal(get(() => assert.fail('success stays cached')), retry);
+});
+
+test('primary and alternate attempts share an eight-second maximum registration budget', async () => {
+    let now = Date.now();
+    const start = now;
+    const get = load({ now: () => now });
+    let calls = 0;
+    await get(async (_url, _options, deadline) => {
+        calls++;
+        assert.ok(deadline <= start + 8000);
+        if (calls === 1) {
+            assert.equal(deadline, start + 4000);
+            now += 4100;
+            throw Object.assign(new Error('primary timeout'), { code: 'ETIMEDOUT' });
+        }
+        assert.equal(deadline, start + 8000);
+        return { device_id: '123', install_id: '456' };
+    });
+    assert.equal(calls, 2);
 });

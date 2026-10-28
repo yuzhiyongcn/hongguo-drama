@@ -9,7 +9,7 @@ const sourcePath = path.resolve(__dirname, '../src/native/app-source.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
 const vid = '7700946421087751193';
 
-function load(axios, { realDevice = false, getPlaybackDevice, now } = {}) {
+function load(axios, { realDevice = false, getPlaybackDevice, getDevice, now, clock = Date } = {}) {
   const module = { exports: {} };
   const context = vm.createContext({
     module,
@@ -19,11 +19,11 @@ function load(axios, { realDevice = false, getPlaybackDevice, now } = {}) {
       if (name === './sm3') return require('../src/native/sm3');
       if (name === './download-quality') return require('../src/native/download-quality');
       if (name === './playback-device') return getPlaybackDevice ? { getPlaybackDevice } : realDevice ? require('../src/native/playback-device')
-        : { getPlaybackDevice: async () => ({ device_id: '1000000000000001', iid: '1000000000000002', cdid: 'fixture' }) };
+        : { getPlaybackDevice: getDevice || (async () => ({ device_id: '1000000000000001', iid: '1000000000000002', cdid: 'fixture' })) };
       if (name === 'axios') return axios;
       return require(name);
     },
-    Date: class extends Date { static now() { return now ? now() : Date.now(); } },
+    Date: now ? class extends clock { static now() { return now(); } } : clock,
     Buffer,
     URL,
     AbortSignal,
@@ -192,5 +192,29 @@ function row(definition, width, height, suffix) {
   assert.equal(modelCalls, 2);
   assert.ok(simultaneous.every(result => result.url === plain.main_url));
   assert.doesNotMatch(JSON.stringify(simultaneous), /synthetic-unused-token/);
-  console.log('PASS app source recovery: empty response, legacy quality lock, inline URLs/keys and trust boundaries');
+  let now = Date.now();
+  const delayedDevice = load(async config => {
+    assert.equal(config.timeout, 12000, 'registration time must not consume the model-request budget');
+    return inlineResponse([plain]);
+  }, {
+    clock: class extends Date { static now() { return now; } },
+    getDevice: async () => {
+      now += 15000;
+      return { device_id: '1000000000000001', iid: '1000000000000002', cdid: 'fixture' };
+    },
+  });
+  assert.equal((await delayedDevice.fetchAppPlayUrl(vid)).url, plain.main_url);
+  for (const code of ['ENOENT', 'ERR_TLS_CERT_ALTNAME_INVALID', 'CERT_HAS_EXPIRED']) {
+    await assert.rejects(load(async () => { throw Object.assign(new Error('PRIVATE_RESPONSE_SENTINEL'), { code }); })
+      .requestJson('https://is.snssdk.com/service/2/device_register/', { method: 'POST' }, Date.now() + 4000, AbortSignal.timeout(4000)),
+      error => error.code === code && !error.message.includes('PRIVATE_RESPONSE_SENTINEL'));
+  }
+  let redirects = 0;
+  await assert.rejects(load(async () => {
+    redirects++;
+    return { status: 307, headers: { location: 'https://is.snssdk.com/redirect' }, data: '' };
+  }).requestJson('https://log5-applog-lf.fqnovel.com/service/2/device_register/', { method: 'POST' }, Date.now() + 4000, AbortSignal.timeout(4000)),
+  error => error.code === 'SECURITY_BLOCKED');
+  assert.equal(redirects, 1, 'registration must not follow a POST redirect');
+  console.log('PASS app source recovery: empty response, quality lock, inline URLs/keys, independent deadlines and registration trust boundaries');
 })().catch(error => { console.error(error.stack || error.message); process.exitCode = 1; });

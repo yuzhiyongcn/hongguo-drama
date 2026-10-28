@@ -84,7 +84,7 @@ const checks = [
       [{ code: 'INVALID_RESPONSE' }, 'DEVICE_REGISTRATION_FAILED', '有效设备编号'],
       [{ code: 'BUSINESS_REJECTED' }, 'DEVICE_REGISTRATION_FAILED', '拒绝注册'],
       [{ code: 'SECURITY_BLOCKED' }, 'DEVICE_REGISTRATION_FAILED', '安全校验'],
-      [{ code: 'secret' }, 'DEVICE_REGISTRATION_FAILED', '10 秒后重试'],
+      [{ code: 'secret' }, 'DEVICE_REGISTRATION_FAILED', '网络连接失败'],
     ]) {
       const device = load('playback-device.js', {});
       const getPlaybackDevice = async request => device.getPlaybackDevice(async (...args) => {
@@ -109,7 +109,7 @@ const checks = [
         throw Object.assign(new Error('secret'), { code: 'DEVICE_REGISTRATION_FAILED', registrationFailure });
       } } });
       const result = await f.fetchPlayUrlSingle('11', '1', { quality: '720p' });
-      assert.equal(result.sources[0].message, '匿名播放设备注册失败，请检查网络，10 秒后重试');
+      assert.equal(result.sources[0].message, '匿名播放设备注册失败，请检查网络后重试');
       assert.doesNotMatch(JSON.stringify(result), /secret|function|\[object/);
     }
   }],

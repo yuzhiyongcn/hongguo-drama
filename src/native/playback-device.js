@@ -4,14 +4,24 @@
 // kotlin-tv/core/src/main/kotlin/com/hongguotv/core/DeviceRegister.kt
 // (itself adapted from charlie901208/HGTV feat/phone-login, GPL-3.0-only).
 // Changes: fixed anonymous phone profile; process-only identity; no cookies or tokens.
+// Upstream also documents is.snssdk.com as an equivalent official registration origin.
 const crypto = require('node:crypto');
 const { gzipSync } = require('node:zlib');
 
 const REGISTER_URL = 'https://log5-applog-lf.fqnovel.com/service/2/device_register/?tt_data=a&cronet_version=8d40f833_2026-03-03&ttnet_version=4.2.243.31-douyin&use_store_region_cookie=1';
 const KDF_SALT = Buffer.from('4dd4c2e6b83162090e52b3c7a6733ba41cb2462b829ab58a196b39db57177524f49baf7f08e8d68d26a72e37c1a95a2f1f05a51892aef2949732b62a38aadd58', 'hex');
+const REGISTER_URLS = [REGISTER_URL, REGISTER_URL.replace('log5-applog-lf.fqnovel.com', 'is.snssdk.com')];
+const RETRY_COOLDOWN_MS = 30000;
+const RETRYABLE_CODES = new Set(['ENOENT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNABORTED', 'ETIMEDOUT',
+    'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_NETWORK', 'ERR_CANCELED']);
 let registration;
 let refreshAfter = 0;
-let retryAfter = 0;
+let retryAt = Infinity;
+let deviceProfile;
+
+function retryable(error) {
+    return RETRYABLE_CODES.has(error?.code) || Number(error?.status) >= 500 && Number(error?.status) <= 599;
+}
 
 function responseId(response, name) {
     const preferred = response?.[`${name}_str`];
@@ -23,7 +33,9 @@ function responseId(response, name) {
 async function registerPlaybackDevice(requestJson) {
     try {
             const now = Date.now();
-            const cdid = crypto.randomUUID();
+            deviceProfile ||= { cdid: crypto.randomUUID(), openudid: crypto.randomBytes(8).toString('hex'),
+                clientudid: crypto.randomUUID(), installedAt: now };
+            const { cdid, openudid, clientudid } = deviceProfile;
             const header = {
                 display_name: '红果免费短剧', update_version_code: 73932, manifest_version_code: 73932,
                 app_version_minor: '7.3.9.32', aid: 8662, channel: 'update_64', package: 'com.phoenix.read',
@@ -34,12 +46,12 @@ async function registerPlaybackDevice(requestJson) {
                 resolution: '1280x2772', language: 'zh', timezone: 8, access: 'wifi', not_request_sender: 0,
                 carrier: 'CHINA MOBILE', mcc_mnc: '46000', rom: 'eng.root.20231116.160340',
                 rom_version: 'W528JS release-keys', cdid,
-                sig_hash: '56a962410c494bbaf0b58dba20cae56f', openudid: crypto.randomBytes(8).toString('hex'),
-                clientudid: crypto.randomUUID(), ipv6_list: [], region: 'CN', tz_name: 'Asia/Shanghai',
+                sig_hash: '56a962410c494bbaf0b58dba20cae56f', openudid,
+                clientudid, ipv6_list: [], region: 'CN', tz_name: 'Asia/Shanghai',
                 tz_offset: 28800, sim_region: 'cn', sim_serial_number: [], oaid_may_support: false,
                 req_id: crypto.randomUUID(), device_platform: 'android',
                 custom: { account_region_src: 'fallback', account_region: 'cn', host_bit: 64, dragon_device_type: 'phone' }, pre_installed_channel: '',
-                apk_first_install_time: now, is_system_app: 0, sdk_flavor: 'china', guest_mode: 0,
+                apk_first_install_time: deviceProfile.installedAt, is_system_app: 0, sdk_flavor: 'china', guest_mode: 0,
             };
             const compressed = gzipSync(Buffer.from(JSON.stringify({ magic_tag: 'ss_app_log', header, _gen_time: now })));
             const random = crypto.randomBytes(32);
@@ -49,7 +61,7 @@ async function registerPlaybackDevice(requestJson) {
             const cipher = crypto.createCipheriv('aes-128-cbc', derived.subarray(0, 16), derived.subarray(16, 32));
             const plaintext = Buffer.concat([crypto.createHash('sha512').update(compressed).digest(), compressed]);
             const data = Buffer.concat([Buffer.from('746305100000', 'hex'), random, cipher.update(plaintext), cipher.final()]);
-            const response = await requestJson(REGISTER_URL, {
+            const options = {
                 method: 'POST',
                 headers: {
                     'User-Agent': 'com.phoenix.read/72232 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3)',
@@ -60,7 +72,21 @@ async function registerPlaybackDevice(requestJson) {
                     'x-ss-stub': crypto.createHash('md5').update(data).digest('hex').toUpperCase(),
                 },
                 data,
-            }, Date.now() + 8000, AbortSignal.timeout(8000));
+            };
+            const deadline = Date.now() + 8000;
+            let response;
+            for (const [index, url] of REGISTER_URLS.entries()) {
+                const timeout = Math.min(4000, deadline - Date.now());
+                if (timeout <= 0) throw Object.assign(new Error('Registration timeout'), { code: 'ETIMEDOUT' });
+                try {
+                    // Fixed official origins only; reuse the same binary body and identity.
+                    // Do not follow POST redirects or retry a business rejection / invalid identity.
+                    response = await requestJson(url, options, Date.now() + timeout, AbortSignal.timeout(timeout));
+                    break;
+                } catch (error) {
+                    if (!retryable(error) || index === REGISTER_URLS.length - 1) throw error;
+                }
+            }
             const device_id = responseId(response, 'device_id');
             const iid = responseId(response, 'install_id');
             if (Number(response?.code ?? response?.Code ?? 0) !== 0) throw Object.assign(new Error('Registration rejected'), { code: 'BUSINESS_REJECTED' });
@@ -70,18 +96,23 @@ async function registerPlaybackDevice(requestJson) {
         const status = Number(error?.status);
         const registrationFailure = Number.isInteger(status) && status >= 300 && status <= 599 ? `HTTP_${status}`
             : ['ECONNABORTED', 'ETIMEDOUT'].includes(error?.code) ? 'TIMEOUT'
-            : ['ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_NETWORK', 'ERR_CANCELED'].includes(error?.code) ? 'NETWORK_ERROR'
+            : ['ENOENT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_NETWORK', 'ERR_CANCELED'].includes(error?.code) ? 'NETWORK_ERROR'
             : ['EMPTY_RESPONSE', 'INVALID_RESPONSE', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED'].includes(error?.code) ? error.code : 'UNKNOWN';
-        throw Object.assign(new Error('匿名播放设备注册失败，请检查网络，10 秒后重试'), {
-            code: 'DEVICE_REGISTRATION_FAILED', registrationFailure,
+        // Only safe classifications may leave this module, never response IDs or tokens.
+        const reason = ['ENOENT', 'ENOTFOUND', 'EAI_AGAIN'].includes(error?.code) ? 'dns'
+            : ['ECONNABORTED', 'ETIMEDOUT', 'ERR_CANCELED'].includes(error?.code) ? 'timeout'
+            : retryable(error) ? 'network' : 'rejected';
+        throw Object.assign(new Error('匿名播放设备注册失败，请检查网络后重试'), {
+            code: 'DEVICE_REGISTRATION_FAILED', reason, registrationFailure,
         });
     }
 }
 
 function getPlaybackDevice(requestJson, rejectedDevice) {
-    if (retryAfter && Date.now() >= retryAfter) {
+    // Transient failures retry with the SAME profile; permanent rejections stay cached.
+    if (registration && Date.now() >= retryAt) {
         registration = undefined;
-        retryAfter = 0;
+        retryAt = Infinity;
     }
     if (rejectedDevice && registration) {
         const previous = registration;
@@ -97,9 +128,8 @@ function getPlaybackDevice(requestJson, rejectedDevice) {
             return registration;
         });
     }
-    // Share failures briefly to avoid concurrent retries, then allow recovery without restarting.
     registration ||= Promise.resolve().then(() => registerPlaybackDevice(requestJson)).catch(error => {
-        retryAfter = Date.now() + 10000;
+        if (['dns', 'timeout', 'network'].includes(error.reason)) retryAt = Date.now() + RETRY_COOLDOWN_MS;
         throw error;
     });
     return registration;

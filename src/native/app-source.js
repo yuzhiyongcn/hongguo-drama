@@ -332,8 +332,10 @@ async function requestJson(url, options, deadline, signal) {
                 validateStatus: () => true,
             });
         } catch (error) {
-            const code = signal.aborted ? 'ETIMEDOUT' : ['ECONNABORTED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN',
-                'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_CANCELED'].includes(error.code) ? error.code : 'ERR_NETWORK';
+            const code = signal.aborted ? 'ETIMEDOUT' : ['ECONNABORTED', 'ETIMEDOUT', 'ENOENT', 'ENOTFOUND', 'EAI_AGAIN',
+                'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_CANCELED',
+                'ERR_TLS_CERT_ALTNAME_INVALID', 'CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT',
+                'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'SELF_SIGNED_CERT_IN_CHAIN'].includes(error.code) ? error.code : 'ERR_NETWORK';
             throw Object.assign(new Error(['ECONNABORTED', 'ETIMEDOUT'].includes(code)
                 ? 'App 片源请求超时' : 'App 片源网络请求失败，请稍后重试'), { code });
         }
@@ -365,6 +367,7 @@ async function fetchAppPlayUrl(vid, options = {}) {
     const allowLowerQuality = options.allowLowerQuality === true && requestedQuality !== 'auto';
     vid = String(vid || '');
     if (!/^\d{1,30}$/.test(vid)) throw new Error('分集编号无效');
+
     const payload = JSON.stringify({
         biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
         mixed_video_id_map: { '1004': [vid] },
@@ -391,6 +394,7 @@ async function fetchAppPlayUrl(vid, options = {}) {
             await new Promise(resolve => setTimeout(resolve, 300));
         }
     }
+
     if (Number(response.Code || response.code || 0) !== 0) throw Object.assign(new Error('App 接口暂未提供本集播放信息'), { code: 'BUSINESS_REJECTED' });
     const entry = response.data?.[vid];
     const model = typeof entry?.video_model === 'string' ? jsonBody(entry.video_model) : entry?.video_model;
